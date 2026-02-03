@@ -5,94 +5,94 @@ import tempfile
 from sort import *
 from ultralytics import YOLO
 
-# --- CONFIG ---
-st.set_page_config(page_title="Vehicle Speed Monitor", layout="wide")
+# --- APP SETUP ---
+st.set_page_config(page_title="Speed Tracker", layout="wide")
 
 @st.cache_resource
-def load_model():
-    return YOLO('yolov8n.pt')
+def get_model():
+    return YOLO('yolov8n.pt') # Using Nano for speed
 
-model = load_model()
+model = get_model()
 
 # --- UI ---
-st.title("🚗 Live Vehicle Tracking")
+st.sidebar.header("Settings")
 video_file = st.sidebar.file_uploader("Upload Video", type=["mp4", "avi"])
-start_btn = st.sidebar.button("Start Tracking")
+run_app = st.sidebar.checkbox("Run Tracking")
 
-col1, col2 = st.columns([3, 1])
-video_placeholder = col1.empty()
-log_placeholder = col2.empty()
+col_left, col_right = st.columns([3, 1])
+view = col_left.empty()
+log_box = col_right.empty()
 
-if video_file and start_btn:
-    # 1. Save and Open Video
+# --- LOGIC ---
+if video_file and run_app:
     tfile = tempfile.NamedTemporaryFile(delete=False)
     tfile.write(video_file.read())
-    cap = cv2.VideoCapture(tfile.name)
     
-    # 2. Setup Tracker
-    tracker = Sort(max_age=30)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    PIXEL_TO_METER = 5 / 200 
+    cap = cv2.VideoCapture(tfile.name)
+    # Get actual video FPS
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps < 1: fps = 30
+    
+    tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
     prev_positions = {}
-    logs = []
-
-    # 3. Processing Loop
-    frame_count = 0
+    
+    # Constants
+    M_PER_PX = 5 / 200 
+    
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        
-        frame_count += 1
-        # SKIP FRAMES to keep video moving (Process every 2nd frame)
-        if frame_count % 2 != 0:
-            continue
 
-        # Resize to make it light for the web browser
+        # 1. Resize immediately (Smaller = Much Faster)
         frame = cv2.resize(frame, (640, 360))
         
-        # YOLO Detection (Optimized)
-        results = model(frame, verbose=False, stream=True)
-        detections = np.empty((0, 5))
-
+        # 2. YOLO - We use .predict for better control
+        results = model.predict(frame, conf=0.5, verbose=False, device='cpu')
+        
+        # 3. Format detections for SORT: [x1, y1, x2, y2, score]
+        detections = []
         for r in results:
             for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                conf = box.conf[0].cpu().numpy()
-                cls = int(box.cls[0].cpu().numpy())
-                
-                if cls in [2, 3, 5, 7] and conf > 0.4: # Car, Bus, Truck
-                    detections = np.vstack((detections, [x1, y1, x2, y2, conf]))
-
-        # SORT Update
-        track_result = tracker.update(detections)
+                # Class 2=car, 3=motorcycle, 5=bus, 7=truck (COCO dataset)
+                cls = int(box.cls[0])
+                if cls in [2, 3, 5, 7]:
+                    b = box.xyxy[0].cpu().numpy()
+                    conf = box.conf[0].cpu().numpy()
+                    detections.append([b[0], b[1], b[2], b[3], conf])
         
-        for res in track_result:
-            x1, y1, x2, y2, obj_id = map(int, res)
+        # Convert to numpy for SORT
+        if len(detections) > 0:
+            detections = np.array(detections)
+        else:
+            detections = np.empty((0, 5))
+
+        # 4. Update Tracker
+        tracks = tracker.update(detections)
+        
+        # 5. Speed & Drawing
+        for trk in tracks:
+            x1, y1, x2, y2, obj_id = map(int, trk)
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             
-            # Speed logic
             speed = 0
             if obj_id in prev_positions:
                 px, py = prev_positions[obj_id]
                 dist = np.sqrt((cx - px)**2 + (cy - py)**2)
-                # Multiply by 2 because we are skipping every 2nd frame
-                speed = (dist * PIXEL_TO_METER) * (fps / 2) * 3.6
+                # Speed = (Distance * Scale) / (1 / FPS) * 3.6 (for km/h)
+                speed = (dist * M_PER_PX) * fps * 3.6
             
             prev_positions[obj_id] = (cx, cy)
 
-            # Draw on frame
+            # Visuals
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"ID {obj_id}: {int(speed)}km/h", (x1, y1-5), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(frame, f"ID:{obj_id} {int(speed)}km/h", (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # CRITICAL: Push the frame to Streamlit
-        # Using BGR2RGB because Streamlit expects RGB
-        video_placeholder.image(frame, channels="BGR", use_container_width=True)
-        
-        # Update logs sparingly to save performance
-        if frame_count % 10 == 0:
-            log_placeholder.code("\n".join(logs[-10:]))
+        # 6. CRITICAL: Show the frame
+        # We convert to RGB because Streamlit expects it
+        view.image(frame, channels="BGR", use_container_width=True)
 
     cap.release()
-    st.success("Processing Finished")
+else:
+    st.info("Upload a video and check 'Run Tracking' to start.")
