@@ -2,75 +2,68 @@ import streamlit as st
 import cv2
 import numpy as np
 import tempfile
-from sort import *
+from sort import * # Ensure sort.py is in your GitHub
 from ultralytics import YOLO
 
-# --- APP SETUP ---
-st.set_page_config(page_title="Speed Tracker", layout="wide")
+st.set_page_config(page_title="Speed Monitor", layout="wide")
 
 @st.cache_resource
-def get_model():
-    return YOLO('yolov8n.pt') # Using Nano for speed
+def load_yolo():
+    return YOLO('yolov8n.pt')
 
-model = get_model()
+model = load_yolo()
 
-# --- UI ---
-st.sidebar.header("Settings")
-video_file = st.sidebar.file_uploader("Upload Video", type=["mp4", "avi"])
-run_app = st.sidebar.checkbox("Run Tracking")
+st.title("Vehicle Tracker Debug Version")
 
-col_left, col_right = st.columns([3, 1])
-view = col_left.empty()
-log_box = col_right.empty()
+uploaded_file = st.sidebar.file_uploader("Choose a video...", type=["mp4", "avi"])
+run_tracking = st.sidebar.checkbox("Run Tracking")
 
-# --- LOGIC ---
-if video_file and run_app:
+video_display = st.empty()
+status_text = st.sidebar.empty()
+
+if uploaded_file and run_tracking:
     tfile = tempfile.NamedTemporaryFile(delete=False)
-    tfile.write(video_file.read())
+    tfile.write(uploaded_file.read())
     
     cap = cv2.VideoCapture(tfile.name)
-    # Get actual video FPS
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps < 1: fps = 30
-    
-    tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
+    tracker = Sort(max_age=30)
     prev_positions = {}
     
     # Constants
-    M_PER_PX = 5 / 200 
-    
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    PIXEL_TO_METER = 5 / 200
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # 1. Resize immediately (Smaller = Much Faster)
+        # 1. Resize small for web speed
         frame = cv2.resize(frame, (640, 360))
         
-        # 2. YOLO - We use .predict for better control
-        results = model.predict(frame, conf=0.5, verbose=False, device='cpu')
+        # 2. Simple YOLO Detect
+        results = model.predict(frame, conf=0.4, verbose=False)
         
-        # 3. Format detections for SORT: [x1, y1, x2, y2, score]
         detections = []
         for r in results:
             for box in r.boxes:
-                # Class 2=car, 3=motorcycle, 5=bus, 7=truck (COCO dataset)
                 cls = int(box.cls[0])
-                if cls in [2, 3, 5, 7]:
+                if cls in [2, 3, 5, 7]: # Car, Motorcycle, Bus, Truck
                     b = box.xyxy[0].cpu().numpy()
                     conf = box.conf[0].cpu().numpy()
                     detections.append([b[0], b[1], b[2], b[3], conf])
-        
-        # Convert to numpy for SORT
-        if len(detections) > 0:
-            detections = np.array(detections)
-        else:
-            detections = np.empty((0, 5))
 
-        # 4. Update Tracker
-        tracks = tracker.update(detections)
-        
-        # 5. Speed & Drawing
+        # 3. Safe Tracker Update
+        try:
+            if len(detections) > 0:
+                tracks = tracker.update(np.array(detections))
+            else:
+                tracks = tracker.update(np.empty((0, 5)))
+        except Exception as e:
+            st.error(f"Tracker Error: {e}")
+            tracks = []
+
+        # 4. Speed Logic
         for trk in tracks:
             x1, y1, x2, y2, obj_id = map(int, trk)
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -79,20 +72,17 @@ if video_file and run_app:
             if obj_id in prev_positions:
                 px, py = prev_positions[obj_id]
                 dist = np.sqrt((cx - px)**2 + (cy - py)**2)
-                # Speed = (Distance * Scale) / (1 / FPS) * 3.6 (for km/h)
-                speed = (dist * M_PER_PX) * fps * 3.6
+                speed = (dist * PIXEL_TO_METER) * fps * 3.6
             
             prev_positions[obj_id] = (cx, cy)
 
-            # Visuals
+            # Draw
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"ID:{obj_id} {int(speed)}km/h", (x1, y1-10),
+            cv2.putText(frame, f"ID:{obj_id} {int(speed)}km/h", (x1, y1-10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # 6. CRITICAL: Show the frame
-        # We convert to RGB because Streamlit expects it
-        view.image(frame, channels="BGR", use_container_width=True)
+        # 5. Force Update
+        video_display.image(frame, channels="BGR")
+        status_text.text(f"Processing... (FPS: {int(fps)})")
 
     cap.release()
-else:
-    st.info("Upload a video and check 'Run Tracking' to start.")
