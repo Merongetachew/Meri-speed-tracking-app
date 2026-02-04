@@ -1,67 +1,76 @@
 import streamlit as st
 import cv2
 import numpy as np
-import time
-from threading import Thread, Event
-from sort import Sort
 from ultralytics import YOLO
-from PIL import Image, ImageDraw, ImageFont
-import io
-
+from sort import Sort # Ensure sort.py is in your directory
+from PIL import Image
 # Calibration for real-world measurements
 CALIBRATION_DISTANCE = 5  # in meters
 CALIBRATION_PIXELS = 200  # in pixels
 PIXEL_TO_METER = CALIBRATION_DISTANCE / CALIBRATION_PIXELS
 FRAME_RATE = 30
 
-# Global state (per user session)
-stop_event = None
-video_fp = None
+# Global variables
+stop_tracking = False
+video_path = None
 tracker = Sort(max_age=30)
 model = YOLO('yolov8n.pt')
-log_messages = []
-display_frame = None
-video_seed = None
+log_window = None
+log_text_widget = None
 
+# Load class names
 classnames = []
-try:
-    with open('classes.txt', 'r') as f:
-        classnames = f.read().splitlines()
-except Exception:
-    # Fallback if classes.txt is not available
-    classnames = []
+with open('classes.txt', 'r') as f:
+    classnames = f.read().splitlines()
 
-def add_log(msg: str):
-    timestamp = time.strftime("%H:%M:%S")
-    log_messages.append(f"[{timestamp}] {msg}")
+def open_log_window():
+    """Open a separate window for logs."""
+    global log_window, log_text_widget
+    if log_window is None or not tk.Toplevel.winfo_exists(log_window):
+        log_window = tk.Toplevel()
+        log_window.title("Log Window")
+        log_window.geometry("600x400")
+        log_text_widget = tk.Text(log_window, wrap="word", font=("Helvetica", 10))
+        log_text_widget.pack(expand=True, fill=tk.BOTH)
 
-def process_video_stream(frame_generator, stop_evt: Event, display_queue: "list[str]"):
-    """
-    Process frames from a generator, update display_queue with processed frames (as PIL Images)
-    """
-    global tracker
-    cap_fps = FRAME_RATE
+def log_message(message):
+    """Log messages to the log window."""
+    if log_text_widget:
+        try:
+            log_text_widget.after(0, lambda: _update_log_widget(message))
+        except:
+            pass
+
+def _update_log_widget(message):
+    """Update the log widget."""
+    log_text_widget.insert(tk.END, message + "\n")
+    log_text_widget.see(tk.END)
+
+def start_tracking(canvas, info_label):
+    global stop_tracking, video_path, tracker
+
+    if not video_path:
+        messagebox.showerror("Error", "Please select a video file first!")
+        return
+
+    stop_tracking = False
+    tracker = Sort(max_age=30)
+
+    cap = cv2.VideoCapture(video_path)
     prev_positions = {}
 
-    while not stop_evt.is_set():
-        try:
-            frame = next(frame_generator)
-        except StopIteration:
-            add_log("End of uploaded video.")
-            stop_evt.set()
-            break
-        except Exception as e:
-            add_log(f"Frame read error: {e}")
-            stop_evt.set()
+    log_message("Tracking started.")
+
+    while not stop_tracking:
+        ret, frame = cap.read()
+        if not ret:
+            log_message("End of video or error reading the frame.")
             break
 
-        # Resize for display
         display_width, display_height = 800, 450
         frame = cv2.resize(frame, (display_width, display_height))
 
         detections = np.empty((0, 5))
-
-        # Run object detection
         results = model(frame, stream=1)
 
         for info in results:
@@ -70,178 +79,130 @@ def process_video_stream(frame_generator, stop_evt: Event, display_queue: "list[
                 x1, y1, x2, y2 = box.xyxy[0]
                 conf = box.conf[0]
                 classindex = box.cls[0]
-                object_detected = classnames[int(classindex)] if classindex < len(classnames) else f"class{int(classindex)}"
+                object_detected = classnames[int(classindex)]
 
                 if object_detected in ['car', 'truck', 'bus'] and conf > 0.6:
-                    x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-                    new_det = np.array([x1, y1, x2, y2, conf])
-                    detections = np.vstack((detections, new_det))
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    new_detections = np.array([x1, y1, x2, y2, conf])
+                    detections = np.vstack((detections, new_detections))
 
-        tracker_results = tracker.update(detections)
+        track_result = tracker.update(detections)
+        frame_time = 1 / FRAME_RATE
 
-        for res in tracker_results:
-            x1, y1, x2, y2, obj_id = map(int, res)
+        for result in track_result:
+            x1, y1, x2, y2, obj_id = map(int, result)
             center_x = (x1 + x2) // 2
             center_y = (y1 + y2) // 2
 
             if obj_id in prev_positions:
                 prev_x, prev_y, prev_time = prev_positions[obj_id]
-                distance_pixels = np.hypot(center_x - prev_x, center_y - prev_y)
-                frame_time = 1.0 / cap_fps
+                distance_pixels = np.sqrt((center_x - prev_x) ** 2 + (center_y - prev_y) ** 2)
                 speed_kmph = (distance_pixels * PIXEL_TO_METER) / frame_time * 3.6
             else:
-                speed_kmph = 0.0
+                speed_kmph = 0
 
             prev_positions[obj_id] = (center_x, center_y, time.time())
 
-            object_class = "Unknown"
-            # Note: obj_id corresponds to detection id; we didn't store class per track.
-            # If you want class labels per track, extend code to keep mapping.
-
-            # Draw
+            log_message(f"ID: {obj_id} | Class: {object_detected} | Speed: {speed_kmph:.1f} km/h")
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = f"ID: {obj_id}  Speed: {speed_kmph:.1f} km/h"
-            cv2.putText(frame, label, (x1, max(y1 - 10, 10)),
+            cv2.putText(frame, f'ID: {obj_id}  Speed: {speed_kmph:.1f} km/h', (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
-        # Convert to RGB for display
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(img_rgb)
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Push to display queue
-        display_queue.append(pil_img)
+        # Use after() to schedule the image update on the main thread
+        try:
+            canvas.after(0, update_canvas, canvas, ImageTk.PhotoImage(Image.fromarray(img)))
+        except:
+            continue
 
-        # Maintain frame rate
-        time.sleep(1.0 / cap_fps)
-
-def frame_generator_from_video_bytes(bytes_buffer, fps=30):
-    """
-    Generate frames from a video bytes buffer (uploaded file)
-    """
-    nparr = np.frombuffer(bytes_buffer, np.uint8)
-    cap = cv2.VideoCapture(cv2.imdecode(nparr, cv2.IMREAD_COLOR))
-    while True:
-        ret, frame = cap.read()
-        if not ret:
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        yield frame
+
     cap.release()
+    cv2.destroyAllWindows()
+    log_message("Tracking stopped.")
 
-def start_processing(uploaded_bytes, stop_evt, display_queue):
-    """
-    Entry point to start processing: create a frame generator and run processing loop.
-    """
-    # Create a video capture from the uploaded bytes
-    # Streamlit provides uploaded file as bytes; write to temp buffer
-    if uploaded_bytes is None:
-        add_log("No video uploaded.")
-        stop_evt.set()
-        return
 
-    # Try to read as a video file path-like object
-    # We'll write to a temporary in-memory buffer and open with OpenCV
-    video_bytes = uploaded_bytes.read()
-    # Use a memory buffer as a temporary file
-    nparr = np.frombuffer(video_bytes, np.uint8)
-    cap = cv2.VideoCapture(cv2.imdecode(nparr, cv2.IMREAD_COLOR))
-    if not cap.isOpened():
-        add_log("Failed to open video from uploaded bytes.")
-        stop_evt.set()
-        return
+def update_canvas(canvas, img):
+    """Update the canvas with the image."""
+    canvas.create_image(0, 0, anchor=tk.NW, image=img)
+    canvas.image = img
 
-    def frame_gen():
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            yield frame
 
-    # Run processing
-    process_video_stream(frame_gen(), stop_evt, display_queue)
+def stop_tracking_process():
+    global stop_tracking
+    stop_tracking = True
+    log_message("Tracking stopped by user.")
 
-def to_pil_image(img: Image.Image):
-    return img
 
-def streamlit_app():
-    st.title("Vehicle Speed Monitoring System (Streamlit)")
-    st.write("Upload a video file and start tracking to see vehicle speeds.)
+def stop_monitoring():
+    global stop_tracking
+    stop_tracking = True
+    root.quit()  # Stops the Tkinter main loop
+    sys.exit(1)
 
-    "
 
-    st.set_option('deprecation.showfileUploaderEncoding', False)
+def load_video():
+    global video_path
+    video_path = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4;*.avi")])
+    if video_path:
+        messagebox.showinfo("Video Selected", f"Selected Video: {video_path}")
+        log_message(f"Video selected: {video_path}")
 
-    # Persist state in session
-    if 'stop_event' not in st.session_state:
-        st.session_state.stop_event = Event()
-    if 'display_queue' not in st.session_state:
-        st.session_state.display_queue = []
-    if 'processing_thread' not in st.session_state:
-        st.session_state.processing_thread = None
-    if 'uploaded_video' not in st.session_state:
-        st.session_state.uploaded_video = None
 
-    uploaded_file = st.file_uploader("Upload a video", type=["mp4", "avi", "mov"])
+# Create the Tkinter window
+root = tk.Tk()
+root.title("Vehicle Speed Monitoring System")
+root.geometry("900x700")
+root.configure(bg="#f0f8ff")
 
-    if uploaded_file is not None:
-        st.session_state.uploaded_video = uploaded_file
-        add_log(f"Video uploaded: {uploaded_file.name}")
-        st.success(f"Uploaded: {uploaded_file.name}")
+# Define a style for the buttons
+style = ttk.Style()
+style.configure(
+    "TButton",
+    font=("Helvetica", 12, "bold"),
+    foreground="#000000",
+    background="#ff0000",
+    padding=5
+)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Start Tracking"):
-            if st.session_state.uploaded_video is None:
-                st.error("Please upload a video first.")
-            else:
-                # Reset state
-                st.session_state.stop_event.clear()
-                st.session_state.display_queue.clear()
-                add_log("Starting tracking...")
+style.map(
+    "TButton",
+    background=[('active', '#cc0000')]
+)
 
-                # Start processing in a separate thread
-                def worker():
-                    start_processing(
-                        st.session_state.uploaded_video,
-                        st.session_state.stop_event,
-                        st.session_state.display_queue
-                    )
+# Title
+title_label = tk.Label(root, text="Vehicle Speed Monitoring System", font=("Helvetica", 20, "bold"), bg="#f0f8ff", fg="#333")
+title_label.pack(pady=10)
 
-                t = Thread(target=worker, daemon=True)
-                t.start()
-                st.session_state.processing_thread = t
+# Video canvas
+canvas = tk.Canvas(root, width=800, height=450, bg="#dcdcdc")
+canvas.pack(pady=10)
 
-    with col2:
-        if st.button("Stop Tracking"):
-            st.session_state.stop_event.set()
-            add_log("Tracking stopped by user.")
+# Info label
+info_label = tk.Label(root, text="", font=("Helvetica", 12), bg="#f0f8ff", justify=tk.LEFT, anchor="w")
+info_label.pack(pady=10, fill=tk.BOTH, padx=10)
 
-    st.subheader("Live Preview")
-    preview_placeholder = st.empty()
+# Buttons
+button_frame = tk.Frame(root, bg="#f0f8ff")
+button_frame.pack(pady=10)
 
-    # Logs
-    st.subheader("Logs")
-    log_area = st.empty()
+load_video_button = ttk.Button(button_frame, text="Load Video", style="TButton", command=load_video)
+load_video_button.grid(row=0, column=0, padx=5)
 
-    # Update loop to render frames and logs
-    while True:
-        # Display latest frame if available
-        if st.session_state.display_queue:
-            pil_img = st.session_state.display_queue.pop(0)
-            buf = io.BytesIO()
-            pil_img.save(buf, format='JPEG')
-            img_bytes = buf.getvalue()
-            preview_placeholder.image(img_bytes, caption="Processed Frame", use_column_width=True)
+start_button = ttk.Button(button_frame, text="Start Tracking", style="TButton",
+                          command=lambda: Thread(target=start_tracking, args=(canvas, info_label)).start())
+start_button.grid(row=0, column=1, padx=5)
 
-        # Show logs
-        if log_area:
-            log_area.text("\n".join(log_messages[-100:]))
+stop_button = ttk.Button(button_frame, text="Stop Tracking", style="TButton", command=stop_tracking_process)
+stop_button.grid(row=0, column=2, padx=5)
 
-        # Break condition to avoid infinite loop in Streamlit
-        if st.session_state.stop_event.is_set():
-            break
+log_button = ttk.Button(button_frame, text="View Logs", style="TButton", command=open_log_window)
+log_button.grid(row=0, column=3, padx=5)
 
-        time.sleep(0.1)
-    st.success("Tracking ended.")
+exit_button = ttk.Button(button_frame, text="Exit", style="TButton", command=stop_monitoring)
+exit_button.grid(row=0, column=4, padx=5)
 
-if __name__ == "__main__":
-    streamlit_app()
+# Run the Tkinter loop
+root.mainloop()
