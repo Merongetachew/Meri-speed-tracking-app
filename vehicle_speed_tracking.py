@@ -3,120 +3,94 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from sort import Sort
-from PIL import Image
 import time
 import tempfile
 
-# --- 1. Configuration & Constants ---
-CALIBRATION_DISTANCE = 5  # meters
-CALIBRATION_PIXELS = 200  # pixels
+# --- Setup ---
+st.set_page_config(page_title="Vehicle Speed Tracker", layout="wide")
+st.title("🚗 Live Vehicle Tracking & Speed Estimation")
+
+# Calibration
+CALIBRATION_DISTANCE = 5 
+CALIBRATION_PIXELS = 200 
 PIXEL_TO_METER = CALIBRATION_DISTANCE / CALIBRATION_PIXELS
 FRAME_RATE = 30
 
-st.set_page_config(page_title="Vehicle Speed Tracker", layout="wide")
-
-# --- 2. Model Loading (Cached) ---
+# Initialize Model
 @st.cache_resource
-def load_yolo_model():
+def load_model():
     return YOLO('yolov8n.pt')
 
-@st.cache_resource
-def get_class_names():
-    # Fallback if classes.txt is missing
-    try:
-        with open('classes.txt', 'r') as f:
-            return f.read().splitlines()
-    except FileNotFoundError:
-        return ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck"]
+model = load_model()
+tracker = Sort(max_age=30)
 
-model = load_yolo_model()
-classnames = get_class_names()
+# UI Elements
+video_file = st.sidebar.file_uploader("Upload Video", type=['mp4', 'mov', 'avi'])
+start_btn = st.sidebar.button("Start Processing")
+stop_btn = st.sidebar.button("Stop")
 
-# --- 3. Sidebar UI ---
-st.sidebar.title("Control Panel")
-video_file = st.sidebar.file_uploader("Upload Video", type=['mp4', 'avi', 'mov'])
-run_tracking = st.sidebar.checkbox("Start Tracking")
+# This placeholder is CRITICAL for the video effect
+container = st.empty() 
+log_placeholder = st.sidebar.empty()
 
-# --- 4. Main Interface ---
-st.title("🚀 Vehicle Speed Monitoring System")
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    st_frame = st.empty()  # Placeholder for video
-
-with col2:
-    st.subheader("Live Logs")
-    log_container = st.empty() # Placeholder for logs
-
-# --- 5. Processing Logic ---
-if video_file and run_tracking:
-    # Handle the file upload via a temporary file
+if video_file and start_btn:
+    # 1. Save uploaded file to a temporary location
     tfile = tempfile.NamedTemporaryFile(delete=False) 
     tfile.write(video_file.read())
     
     cap = cv2.VideoCapture(tfile.name)
-    tracker = Sort(max_age=30)
     prev_positions = {}
-    logs = []
 
+    # 2. The Video Loop
     while cap.isOpened():
+        if stop_btn:
+            break
+            
         ret, frame = cap.read()
         if not ret:
-            st.warning("End of video reached.")
+            st.write("Video Processing Complete.")
             break
 
-        # Processing Resize
-        frame = cv2.resize(frame, (800, 450))
-        
-        # YOLO Inference
+        # Resize for web performance
+        frame = cv2.resize(frame, (960, 540))
         results = model(frame, stream=True, verbose=False)
+        
         detections = np.empty((0, 5))
-
-        for info in results:
-            boxes = info.boxes
-            for box in boxes:
+        for r in results:
+            for box in r.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 conf = box.conf[0].cpu().numpy()
                 cls = int(box.cls[0].cpu().numpy())
                 
-                if cls < len(classnames):
-                    object_detected = classnames[cls]
-                    if object_detected in ['car', 'truck', 'bus'] and conf > 0.6:
-                        detections = np.vstack((detections, [x1, y1, x2, y2, conf]))
+                # Filter for vehicles (car=2, bus=5, truck=7 in COCO)
+                if cls in [2, 3, 5, 7] and conf > 0.5:
+                    detections = np.vstack((detections, [x1, y1, x2, y2, conf]))
 
-        # SORT Tracking
-        track_result = tracker.update(detections)
-        frame_time = 1 / FRAME_RATE
+        # Update Tracker
+        tracks = tracker.update(detections)
+        
+        for track in tracks:
+            x1, y1, x2, y2, track_id = map(int, track)
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-        for result in track_result:
-            x1, y1, x2, y2, obj_id = map(int, result)
-            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
-
-            # Speed Calculation
-            if obj_id in prev_positions:
-                prev_x, prev_y, _ = prev_positions[obj_id]
-                dist_px = np.sqrt((center_x - prev_x)**2 + (center_y - prev_y)**2)
-                speed_kmph = (dist_px * PIXEL_TO_METER) / frame_time * 3.6
-            else:
-                speed_kmph = 0
-
-            prev_positions[obj_id] = (center_x, center_y, time.time())
-
-            # Draw Visuals
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"ID:{obj_id} {speed_kmph:.1f}km/h", (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Calculate Speed
+            if track_id in prev_positions:
+                px, py = prev_positions[track_id]
+                dist = np.sqrt((cx - px)**2 + (cy - py)**2)
+                speed = (dist * PIXEL_TO_METER) * FRAME_RATE * 3.6
+                
+                cv2.putText(frame, f"ID {track_id}: {int(speed)} km/h", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
-            # Update Logs (Keep only last 10 for performance)
-            log_entry = f"ID: {obj_id} | Speed: {speed_kmph:.1f} km/h"
-            logs.insert(0, log_entry)
-            logs = logs[:10]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            prev_positions[track_id] = (cx, cy)
 
-        # Update UI components
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        st_frame.image(frame_rgb, channels="RGB", use_container_width=True)
-        log_container.code("\n".join(logs))
+        # 3. DISPLAY THE FRAME
+        # Convert BGR (OpenCV) to RGB (Streamlit/PIL)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        container.image(frame, channels="RGB", use_container_width=True)
+
+        # Small sleep to match frame rate (optional, helps UI stability)
+        # time.sleep(0.01) 
 
     cap.release()
-else:
-    st.info("Please upload a video and check 'Start Tracking' in the sidebar.")
